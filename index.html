@@ -1,0 +1,244 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Bengaluru Bus Map</title>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    
+    <link href="https://api.mapbox.com/mapbox-gl-js/v2.15.0/mapbox-gl.css" rel="stylesheet">
+    <script src="https://api.mapbox.com/mapbox-gl-js/v2.15.0/mapbox-gl.js"></script>
+    <script src="https://api.mapbox.com/mapbox-gl-js/plugins/mapbox-gl-directions/v4.1.1/mapbox-gl-directions.js"></script>
+    <link rel="stylesheet" href="https://api.mapbox.com/mapbox-gl-js/plugins/mapbox-gl-directions/v4.1.1/mapbox-gl-directions.css" type="text/css">
+
+    <style>
+        body { margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+        .app-container { display: flex; flex-direction: column; height: 100vh; }
+        header { z-index: 10; }
+        main { flex-grow: 1; position: relative; }
+        #map { position: absolute; top: 0; bottom: 0; width: 100%; }
+        footer {
+            background-color: #fff; border-top: 1px solid #eee; z-index: 10;
+            padding: 5px 0; display: flex; justify-content: space-around;
+        }
+        .footer-btn {
+            background: none; border: none; cursor: pointer; display: flex;
+            flex-direction: column; align-items: center; gap: 4px; padding: 8px 12px;
+            color: #555; font-size: 12px; border-radius: 8px; transition: background-color 0.2s;
+        }
+        .footer-btn:hover { background-color: #f0f0f0; }
+        .footer-btn.active { color: #007cbf; font-weight: bold; }
+        .footer-btn img { width: 28px; height: 28px; }
+
+        .bus-stop-marker {
+            background-image: url('https://cdn-icons-png.flaticon.com/128/684/684908.png');
+            background-size: cover; width: 32px; height: 32px; cursor: pointer;
+        }
+        #back-btn { position: absolute; top: 120px; right: 10px; z-index: 1000; }
+        .map-button {
+            background-color: white; color: #333; border: 2px solid #ccc; border-radius: 4px;
+            padding: 8px 12px; cursor: pointer; font-weight: bold; box-shadow: 0 2px 5px rgba(0,0,0,0.2);
+        }
+        .hidden { display: none; }
+    </style>
+</head>
+<body>
+    <div class="app-container">
+        <header></header>
+        <main>
+            <div id="map"></div>
+            <button id="back-btn" class="map-button hidden">Back to Full Map</button>
+        </main>
+        <footer>
+            <button id="bus-routes-btn" class="footer-btn">
+                <img src="https://cdn-icons-png.flaticon.com/128/3058/3058814.png" alt="Bus Routes">
+                <span>Bus Routes</span>
+            </button>
+            <button id="nearby-btn" class="footer-btn">
+                <img src="https://cdn-icons-png.flaticon.com/128/54/54569.png" alt="Nearby">
+                <span>Find Nearby</span>
+            </button>
+            <button id="all-stops-btn" class="footer-btn">
+                <img src="https://cdn-icons-png.flaticon.com/128/3082/3082405.png" alt="All Stops">
+                <span>Show All Stops</span>
+            </button>
+        </footer>
+    </div>
+
+    <script>
+        mapboxgl.accessToken = 'pk.eyJ1IjoidGhpamVzaC1wcmF2ZWVuIiwiYSI6ImNtZm11ZnJvODA0enkya3M2ejdzdG8zOTMifQ.QcvXILGE71EjlRZHSHCDng'; // PASTE YOUR KEY HERE
+
+        const map = new mapboxgl.Map({
+            container: 'map',
+            style: 'mapbox://styles/mapbox/streets-v12',
+            center: [77.5946, 12.9716],
+            zoom: 12
+        });
+
+        const directions = new MapboxDirections({
+            accessToken: mapboxgl.accessToken,
+            unit: 'metric',
+            profile: 'mapbox/driving',
+            bbox: [77.4, 12.8, 77.8, 13.2],
+            proximity: [77.5946, 12.9716],
+            interactive: false
+        });
+        map.addControl(directions, 'top-left');
+
+        let allBusStopsData = [];
+        let visibleMarkers = [];
+        let userLocationMarker = null;
+        const MIN_ZOOM_LEVEL_FOR_STOPS = 15;
+        let showAllStopsMode = false;
+
+        // --- ALL HELPER FUNCTIONS DEFINED FIRST ---
+        
+        function clearAllMarkers() {
+            visibleMarkers.forEach(marker => marker.remove());
+            visibleMarkers = [];
+        }
+
+        function removeSearchRadius() {
+            if (map.getSource('search-radius-source')) {
+                if (map.getLayer('search-radius-layer')) map.removeLayer('search-radius-layer');
+                if (map.getLayer('search-radius-outline-layer')) map.removeLayer('search-radius-outline-layer');
+                map.removeSource('search-radius-source');
+            }
+        }
+        
+        function clearMap() {
+            clearAllMarkers();
+            removeSearchRadius();
+            if (userLocationMarker) {
+                userLocationMarker.remove();
+                userLocationMarker = null;
+            }
+            directions.removeRoutes();
+            document.querySelectorAll('.footer-btn').forEach(btn => btn.classList.remove('active'));
+            map.off('moveend', updateVisibleMarkersOnMove);
+        }
+
+        function drawSearchRadius(centerCoords) {
+            const radiusKm = 1.0;
+            const points = 64;
+            const center = { latitude: centerCoords[1], longitude: centerCoords[0] };
+            const ret = [];
+            const distanceX = radiusKm / (111.320 * Math.cos(center.latitude * Math.PI / 180));
+            const distanceY = radiusKm / 110.574;
+            for (let i = 0; i < points; i++) {
+                const theta = (i / points) * (2 * Math.PI);
+                ret.push([center.longitude + (distanceX * Math.cos(theta)), center.latitude + (distanceY * Math.sin(theta))]);
+            }
+            ret.push(ret[0]);
+            const circleGeoJSON = { "type": "FeatureCollection", "features": [{ "type": "Feature", "geometry": { "type": "Polygon", "coordinates": [ret] } }] };
+
+            if (map.getSource('search-radius-source')) {
+                map.getSource('search-radius-source').setData(circleGeoJSON);
+            } else {
+                map.addSource('search-radius-source', { type: 'geojson', data: circleGeoJSON });
+                map.addLayer({ id: 'search-radius-layer', type: 'fill', source: 'search-radius-source', paint: { 'fill-color': '#007cbf', 'fill-opacity': 0.1 } });
+                map.addLayer({ id: 'search-radius-outline-layer', type: 'line', source: 'search-radius-source', paint: { 'line-color': '#007cbf', 'line-width': 2 } });
+            }
+        }
+        
+        function displayStopsNear(centerLngLat) {
+            clearAllMarkers();
+            const centerPoint = new mapboxgl.LngLat(centerLngLat[0], centerLngLat[1]);
+            const searchRadiusMeters = 1000;
+
+            for (const stop of allBusStopsData) {
+                const stopPoint = new mapboxgl.LngLat(stop.geometry.coordinates[0], stop.geometry.coordinates[1]);
+                const distance = centerPoint.distanceTo(stopPoint);
+                if (distance <= searchRadiusMeters) {
+                    const el = document.createElement('div');
+                    el.className = 'bus-stop-marker';
+                    const popupText = `<b>${stop.properties.name || "Unnamed Stop"}</b><br>~${Math.round(distance)}m away`;
+                    const popup = new mapboxgl.Popup({ offset: 25 }).setHTML(popupText);
+                    const marker = new mapboxgl.Marker(el).setLngLat(stop.geometry.coordinates).setPopup(popup).addTo(map);
+                    visibleMarkers.push(marker);
+                }
+            }
+        }
+
+        function updateVisibleMarkersOnMove() {
+            clearAllMarkers();
+            if (map.getZoom() < MIN_ZOOM_LEVEL_FOR_STOPS) return;
+            const bounds = map.getBounds();
+            for (const stop of allBusStopsData) {
+                if (bounds.contains(stop.geometry.coordinates)) {
+                    const el = document.createElement('div');
+                    el.className = 'bus-stop-marker';
+                    const popup = new mapboxgl.Popup({ offset: 25 }).setHTML(`<b>${stop.properties.name || "Unnamed Stop"}</b>`);
+                    const marker = new mapboxgl.Marker(el).setLngLat(stop.geometry.coordinates).setPopup(popup).addTo(map);
+                    visibleMarkers.push(marker);
+                }
+            }
+        }
+
+        // --- MAIN LOGIC RUNS AFTER MAP LOADS ---
+        map.on('load', () => {
+            const busRoutesBtn = document.getElementById('bus-routes-btn');
+            const nearbyBtn = document.getElementById('nearby-btn');
+            const allStopsBtn = document.getElementById('all-stops-btn');
+            const backBtn = document.getElementById('back-btn');
+
+            fetch('/api/bus_stops')
+                .then(response => response.json())
+                .then(data => { 
+                    allBusStopsData = data.features;
+                    console.log(`Loaded ${allBusStopsData.length} bus stops.`);
+                })
+                .catch(error => console.error("Failed to load bus stops:", error));
+
+            // Attach Event Listeners
+            busRoutesBtn.addEventListener('click', () => {
+                clearMap();
+                busRoutesBtn.classList.add('active');
+                alert('The "Bus Routes" feature is coming soon!');
+            });
+
+            nearbyBtn.addEventListener('click', () => {
+                clearMap();
+                nearbyBtn.classList.add('active');
+                backBtn.classList.remove('hidden');
+
+                navigator.geolocation.getCurrentPosition(
+                    (position) => {
+                        const userCoords = [position.coords.longitude, position.coords.latitude];
+                        map.flyTo({ center: userCoords, zoom: 16 });
+                        
+                        if (userLocationMarker) userLocationMarker.remove();
+                        userLocationMarker = new mapboxgl.Marker({color: "#007cbf"}).setLngLat(userCoords).addTo(map);
+                        
+                        displayStopsNear(userCoords);
+                        drawSearchRadius(userCoords);
+                    },
+                    (error) => { alert(`LOCATION ERROR: ${error.message}.`); },
+                    { enableHighAccuracy: true }
+                );
+            });
+
+            allStopsBtn.addEventListener('click', () => {
+                clearMap();
+                showAllStopsMode = !showAllStopsMode;
+
+                if (showAllStopsMode) {
+                    allStopsBtn.classList.add('active');
+                    map.on('moveend', updateVisibleMarkersOnMove);
+                    updateVisibleMarkersOnMove();
+                } else {
+                    allStopsBtn.classList.remove('active');
+                    map.off('moveend', updateVisibleMarkersOnMove);
+                    clearAllMarkers();
+                }
+            });
+            
+            backBtn.addEventListener('click', () => {
+                clearMap();
+                backBtn.classList.add('hidden');
+                map.flyTo({ center: [77.5946, 12.9716], zoom: 12 });
+            });
+        });
+
+    </script>
+</body>
+</html>
